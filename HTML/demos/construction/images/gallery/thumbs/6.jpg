@@ -1,0 +1,183 @@
+<?php
+
+/*
+ * This file is part of Composer.
+ *
+ * (c) Nils Adermann <naderman@naderman.de>
+ *     Jordi Boggiano <j.boggiano@seld.be>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Composer\Command;
+
+use Composer\Composer;
+use Composer\Factory;
+use Composer\Config;
+use Composer\Downloader\TransportException;
+use Composer\Plugin\CommandEvent;
+use Composer\Plugin\PluginEvents;
+use Composer\Util\ConfigValidator;
+use Composer\Util\IniHelper;
+use Composer\Util\ProcessExecutor;
+use Composer\Util\RemoteFilesystem;
+use Composer\Util\StreamContextFactory;
+use Composer\SelfUpdate\Keys;
+use Composer\SelfUpdate\Versions;
+use Composer\IO\NullIO;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+
+/**
+ * @author Jordi Boggiano <j.boggiano@seld.be>
+ */
+class DiagnoseCommand extends BaseCommand
+{
+    /** @var RemoteFileSystem */
+    protected $rfs;
+
+    /** @var ProcessExecutor */
+    protected $process;
+
+    /** @var int */
+    protected $exitCode = 0;
+
+    protected function configure()
+    {
+        $this
+            ->setName('diagnose')
+            ->setDescription('Diagnoses the system to identify common errors.')
+            ->setHelp(<<<EOT
+The <info>diagnose</info> command checks common errors to help debugging problems.
+
+The process exit code will be 1 in case of warnings and 2 for errors.
+
+EOT
+            )
+        ;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function execute(InputInterface $input, OutputInterface $output)
+    {
+        $composer = $this->getComposer(false);
+        $io = $this->getIO();
+
+        if ($composer) {
+            $commandEvent = new CommandEvent(PluginEvents::COMMAND, 'diagnose', $input, $output);
+            $composer->getEventDispatcher()->dispatch($commandEvent->getName(), $commandEvent);
+
+            $io->write('Checking composer.json: ', false);
+            $this->outputResult($this->checkComposerSchema());
+        }
+
+        if ($composer) {
+            $config = $composer->getConfig();
+        } else {
+            $config = Factory::createConfig();
+        }
+
+        $config->merge(array('config' => array('secure-http' => false)));
+        $config->prohibitUrlByConfig('http://packagist.org', new NullIO);
+
+        $this->rfs = Factory::createRemoteFilesystem($io, $config);
+        $this->process = new ProcessExecutor($io);
+
+        $io->write('Checking platform settings: ', false);
+        $this->outputResult($this->checkPlatform());
+
+        $io->write('Checking git settings: ', false);
+        $this->outputResult($this->checkGit());
+
+        $io->write('Checking http connectivity to packagist: ', false);
+        $this->outputResult($this->checkHttp('http', $config));
+
+        $io->write('Checking https connectivity to packagist: ', false);
+        $this->outputResult($this->checkHttp('https', $config));
+
+        $opts = stream_context_get_options(StreamContextFactory::getContext('http://example.org'));
+        if (!empty($opts['http']['proxy'])) {
+            $io->write('Checking HTTP proxy: ', false);
+            $this->outputResult($this->checkHttpProxy());
+            $io->write('Checking HTTP proxy support for request_fulluri: ', false);
+            $this->outputResult($this->checkHttpProxyFullUriRequestParam());
+            $io->write('Checking HTTPS proxy support for request_fulluri: ', false);
+            $this->outputResult($this->checkHttpsProxyFullUriRequestParam());
+        }
+
+        if ($oauth = $config->get('github-oauth')) {
+            foreach ($oauth as $domain => $token) {
+                $io->write('Checking '.$domain.' oauth access: ', false);
+                $this->outputResult($this->checkGithubOauth($domain, $token));
+            }
+        } else {
+            $io->write('Checking github.com rate limit: ', false);
+            try {
+                $rate = $this->getGithubRateLimit('github.com');
+                $this->outputResult(true);
+                if (10 > $rate['remaining']) {
+                    $io->write('<warning>WARNING</warning>');
+                    $io->write(sprintf(
+                        '<comment>Github has a rate limit on their API. '
+                        . 'You currently have <options=bold>%u</options=bold> '
+                        . 'out of <options=bold>%u</options=bold> requests left.' . PHP_EOL
+                        . 'See https://developer.github.com/v3/#rate-limiting and also' . PHP_EOL
+                        . '    https://getcomposer.org/doc/articles/troubleshooting.md#api-rate-limit-and-oauth-tokens</comment>',
+                        $rate['remaining'],
+                        $rate['limit']
+                    ));
+                }
+            } catch (\Exception $e) {
+                if ($e instanceof TransportException && $e->getCode() === 401) {
+                    $this->outputResult('<comment>The oauth token for github.com seems invalid, run "composer config --global --unset github-oauth.github.com" to remove it</comment>');
+                } else {
+                    $this->outputResult($e);
+                }
+            }
+        }
+
+        $io->write('Checking disk free space: ', false);
+        $this->outputResult($this->checkDiskSpace($config));
+
+        if ('phar:' === substr(__FILE__, 0, 5)) {
+            $io->write('Checking pubkeys: ', false);
+            $this->outputResult($this->checkPubKeys($config));
+
+            $io->write('Checking composer version: ', false);
+            $this->outputResult($this->checkVersion($config));
+        }
+
+        return $this->exitCode;
+    }
+
+    private function checkComposerSchema()
+    {
+        $validator = new ConfigValidator($this->getIO());
+        list($errors, , $warnings) = $validator->validate(Factory::getComposerFile());
+
+        if ($errors || $warnings) {
+            $messages = array(
+                'error' => $errors,
+                'warning' => $warnings,
+            );
+
+            $output = '';
+            foreach ($messages as $style => $msgs) {
+                foreach ($msgs as $msg) {
+                    $output .= '<' . $style . '>' . $msg . '</' . $style . '>' . PHP_EOL;
+                }
+            }
+
+            return rtrim($output);
+        }
+
+        return true;
+    }
+
+    private function checkGit()
+    {
+        $this->process->execute('git config color.ui', $output);
+        if (strt
